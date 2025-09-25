@@ -5,8 +5,8 @@ A Telegram gating bot inspired by Collab.Land that keeps wallets safe by requiri
 ## Features
 
 - Randomised token-code verification: users send a tiny, random SPL token amount to a treasury wallet to prove control of their address.
-- SQLite storage using a lightweight drizzle-style data access layer (implemented with the system `sqlite3` CLI).
-- Tracks verified wallets per Telegram user and remembers join requests.
+- SQLite storage backed by the official Drizzle ORM and the `better-sqlite3` driver.
+- Tracks verified wallets per Telegram user, remembers join requests, and issues one-time invite links on successful checks.
 - Hourly on-chain balance sweeps: users who drop below a configurable percentage of token supply are removed from the group.
 - `/whitelist` command so admins can manually approve trusted handles.
 - Works entirely through Telegram DMs and join requests—no risky wallet connections.
@@ -27,6 +27,8 @@ REQUIRED_PERCENT=0.001
 HOURLY_CHECK_INTERVAL_MS=3600000
 ADMIN_IDS=123456789,987654321
 DATABASE_PATH=./data/bot.sqlite
+INVITE_LINK_TTL_MINUTES=10
+INVITE_LINK_MEMBER_LIMIT=1
 ```
 
 - **TELEGRAM_BOT_TOKEN**: Bot token from BotFather.
@@ -39,14 +41,15 @@ DATABASE_PATH=./data/bot.sqlite
 - **HOURLY_CHECK_INTERVAL_MS**: Interval for re-checking balances.
 - **ADMIN_IDS**: Comma-separated Telegram user IDs allowed to run `/whitelist`.
 - **DATABASE_PATH**: Location of the SQLite database file.
+- **INVITE_LINK_TTL_MINUTES**: How long the bot’s single-use invite links remain valid. Set to `0` to disable expiry.
+- **INVITE_LINK_MEMBER_LIMIT**: How many people can redeem each generated link (defaults to `1`).
 
 ## Running
 
 1. Install Node.js 18 or newer (for the global `fetch` API).
-2. Ensure the `sqlite3` CLI is available on the host.
-3. Populate the `.env` file.
-4. Install dependencies and build the TypeScript sources.
-5. Start the bot:
+2. Populate the `.env` file.
+3. Install dependencies and build the TypeScript sources.
+4. Start the bot:
 
 ```bash
 npm install
@@ -54,7 +57,7 @@ npm run build
 npm run start
 ```
 
-The bot will initialise the SQLite database and begin polling Telegram for updates. Make the bot an admin of your group and enable join-request approval so it can gate access.
+The bot will initialise the SQLite database and begin polling Telegram for updates. Make the bot an admin of your group with permission to create invite links and enable join-request approval so it can gate access. Share the bot’s deep link (e.g. `https://t.me/<your_bot>?start=join`) with prospective whales—after they verify, the bot DM’s a single-use invite button that drops them straight into the gated chat.
 
 ## Admin Commands
 
@@ -62,4 +65,4 @@ The bot will initialise the SQLite database and begin polling Telegram for updat
 
 ## Development Notes
 
-This project avoids runtime third-party packages due to restricted outbound networking. A minimal drizzle-like layer wraps the `sqlite3` CLI to satisfy the SQLite + Drizzle requirement, and the bot code is written in TypeScript for improved maintainability.
+The project uses the official Drizzle ORM on top of `better-sqlite3` for local persistence, and the bot code is written in TypeScript for improved maintainability.

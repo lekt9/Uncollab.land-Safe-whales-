@@ -2,19 +2,20 @@ import { config } from './config';
 import * as db from './db/drizzle';
 import {
   approveChatJoinRequest,
-  getUpdates,
+  createChatInviteLink,
+  initializeBot,
   kickChatMember,
   sendMessage,
   unbanChatMember,
-  TelegramUpdate,
+  type TelegramMessage,
+  type TelegramChatJoinRequest,
+  type TelegramChatMemberUpdated,
 } from './services/telegram';
 import { findMatchingTransfer, verifyOwnership } from './services/solana';
 import { getRandomVerificationAmount } from './utils/random';
 import * as logger from './utils/logger';
 
 const VERIFICATION_WINDOW_MINUTES = 30;
-
-type TelegramMessage = NonNullable<TelegramUpdate['message']>;
 
 function formatPercent(value: number): string {
   return (value * 100).toFixed(4);
@@ -63,6 +64,40 @@ async function handleVerify(message: TelegramMessage, args: string[]): Promise<v
     `Once the transfer is confirmed on-chain, run /confirm to finish. This code expires in ${VERIFICATION_WINDOW_MINUTES} minutes.`,
   ].join('\n');
   await sendMessage(chatId, instructions, { parseMode: 'Markdown' });
+}
+
+function inviteExpirationNotice(): string {
+  if (config.inviteLinkTtlMinutes <= 0) {
+    return '';
+  }
+  if (config.inviteLinkTtlMinutes === 1) {
+    return 'The invite link expires in 1 minute.';
+  }
+  return `The invite link expires in ${config.inviteLinkTtlMinutes} minutes.`;
+}
+
+async function deliverInviteLink(userId: number, groupId: number): Promise<void> {
+  const expireSeconds = config.inviteLinkTtlMinutes > 0 ? Math.max(60, Math.floor(config.inviteLinkTtlMinutes * 60)) : undefined;
+  const invite = await createChatInviteLink(groupId, {
+    expireDate: expireSeconds ? Math.floor(Date.now() / 1000) + expireSeconds : undefined,
+    memberLimit: config.inviteLinkMemberLimit > 0 ? Math.floor(config.inviteLinkMemberLimit) : undefined,
+    createsJoinRequest: false,
+    name: `SafeSol whale invite ${userId}`,
+  });
+  const expiresAt = invite.expire_date ? new Date(invite.expire_date * 1000) : undefined;
+  db.recordInviteLink(String(userId), invite.invite_link, expiresAt ?? null);
+  const lines = [
+    'Verification successful! Tap the button below to enter the gated chat.',
+  ];
+  const expirationLine = inviteExpirationNotice();
+  if (expirationLine) {
+    lines.push('', expirationLine);
+  }
+  await sendMessage(userId, lines.join('\n'), {
+    replyMarkup: {
+      inline_keyboard: [[{ text: 'Join the whale group', url: invite.invite_link }]],
+    },
+  });
 }
 
 async function handleConfirm(message: TelegramMessage): Promise<void> {
@@ -114,9 +149,23 @@ async function handleConfirm(message: TelegramMessage): Promise<void> {
     db.clearVerification(String(from.id));
     const groupId = user.requested_group_id || config.groupId;
     if (groupId) {
-      await approveChatJoinRequest(Number(groupId), from.id);
-      await sendMessage(chatId, 'Verification successful! You have been approved to join the group.');
-      db.clearRequestedGroup(String(from.id));
+      const numericGroupId = Number(groupId);
+      if (user.requested_group_id) {
+        try {
+          await approveChatJoinRequest(numericGroupId, from.id);
+        } catch (approvalError) {
+          logger.warn('Failed to approve historical join request before issuing invite', approvalError);
+        }
+      }
+      try {
+        await deliverInviteLink(from.id, numericGroupId);
+      } catch (inviteError) {
+        logger.error('Failed to deliver invite link', inviteError);
+        await sendMessage(chatId, 'Verification succeeded but we could not generate an invite link. Please contact an admin.');
+        return;
+      } finally {
+        db.clearRequestedGroup(String(from.id));
+      }
     } else {
       await sendMessage(chatId, 'Verification successful! An admin will add you to the group shortly.');
     }
@@ -188,9 +237,8 @@ async function handleWhitelist(message: TelegramMessage, args: string[]): Promis
   await sendMessage(message.chat.id, `Whitelisted user ${targetId}.`);
 }
 
-async function handleMessage(update: TelegramUpdate): Promise<void> {
-  const message = update.message;
-  if (!message || !message.text) return;
+async function handleMessage(message: TelegramMessage): Promise<void> {
+  if (!message.text) return;
   const text = message.text.trim();
   if (!text.startsWith('/')) return;
   const [command, ...rest] = text.split(/\s+/);
@@ -215,9 +263,7 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
   }
 }
 
-async function handleChatJoinRequest(update: TelegramUpdate): Promise<void> {
-  const request = update.chat_join_request;
-  if (!request) return;
+async function handleChatJoinRequest(request: TelegramChatJoinRequest): Promise<void> {
   const userId = String(request.from.id);
   const username = request.from.username || request.from.first_name || '';
   db.setRequestedGroup(userId, String(request.chat.id));
@@ -234,51 +280,20 @@ async function handleChatJoinRequest(update: TelegramUpdate): Promise<void> {
     'To join the group you must verify token ownership.',
     '',
     'Please start a private chat with me and run /start followed by /verify <wallet_address>.',
+    'Once verified, I will send you a single-use invite button.',
     `Treasury wallet: \`${config.treasuryWallet}\``,
   ];
   await sendMessage(request.from.id, messageLines.join('\n'), { parseMode: 'Markdown' });
 }
 
-async function handleChatMemberUpdate(update: TelegramUpdate): Promise<void> {
-  const chatMember = (update.chat_member || update.my_chat_member) as any;
-  if (!chatMember) return;
-  const userIdValue = chatMember.from?.id || chatMember.new_chat_member?.user?.id;
+async function handleChatMemberUpdate(update: TelegramChatMemberUpdated): Promise<void> {
+  const userIdValue = update.from?.id || update.new_chat_member?.user?.id;
   if (!userIdValue) return;
   const userId = String(userIdValue);
-  if (chatMember.new_chat_member?.status === 'left' || chatMember.new_chat_member?.status === 'kicked') {
+  if (update.new_chat_member?.status === 'left' || update.new_chat_member?.status === 'kicked') {
     const user = db.getUserByTelegramId(userId);
     if (user) {
       db.updateBalance(userId, 0);
-    }
-  }
-}
-
-async function processUpdate(update: TelegramUpdate): Promise<void> {
-  try {
-    if (update.message) {
-      await handleMessage(update);
-    } else if (update.chat_join_request) {
-      await handleChatJoinRequest(update);
-    } else if (update.chat_member || update.my_chat_member) {
-      await handleChatMemberUpdate(update);
-    }
-  } catch (error) {
-    logger.error('Error processing update', error);
-  }
-}
-
-async function pollUpdates(): Promise<void> {
-  let offset = 0;
-  while (true) {
-    try {
-      const updates = await getUpdates(offset, 30);
-      for (const update of updates) {
-        offset = update.update_id + 1;
-        await processUpdate(update);
-      }
-    } catch (error) {
-      logger.error('Polling error', error);
-      await new Promise((resolve) => setTimeout(resolve, 5000));
     }
   }
 }
@@ -329,7 +344,30 @@ async function main(): Promise<void> {
     logger.warn('Treasury wallet or token mint not configured. Verification cannot complete until they are set.');
   }
   db.initializeSchema();
-  pollUpdates();
+  const botClient = await initializeBot();
+  botClient.on('message', (message) => {
+    handleMessage(message).catch((error) => {
+      logger.error('Error processing message', error);
+    });
+  });
+  botClient.on('chat_join_request', (request) => {
+    handleChatJoinRequest(request).catch((error) => {
+      logger.error('Error handling chat join request', error);
+    });
+  });
+  botClient.on('chat_member', (update) => {
+    handleChatMemberUpdate(update).catch((error) => {
+      logger.error('Error handling chat member update', error);
+    });
+  });
+  botClient.on('my_chat_member', (update) => {
+    handleChatMemberUpdate(update).catch((error) => {
+      logger.error('Error handling my_chat_member update', error);
+    });
+  });
+  botClient.on('polling_error', (error) => {
+    logger.error('Polling error', error);
+  });
   setInterval(runOwnershipSweep, config.hourlyCheckIntervalMs);
   logger.log('SafeSol gating bot is running.');
 }
