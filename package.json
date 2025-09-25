@@ -1,0 +1,20 @@
+{
+  "name": "safesolgating",
+  "version": "1.0.0",
+  "description": "Collabland sucks. lets have codex build one that doesnt risk your wallet draining",
+  "main": "dist/bot.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/bot.js",
+    "dev": "ts-node src/bot.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}
