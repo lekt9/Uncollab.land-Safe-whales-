@@ -1,4 +1,5 @@
 import { config } from '../config';
+import * as logger from '../utils/logger';
 
 interface RpcResponse<T> {
   jsonrpc: string;
@@ -105,6 +106,7 @@ async function findMatchingTransfer({
   if (!Array.isArray(signatures)) {
     return null;
   }
+  const debugEntries: string[] = [];
   for (const signatureInfo of signatures) {
     const signature = signatureInfo.signature;
     const tx = await rpcRequest<{
@@ -115,7 +117,10 @@ async function findMatchingTransfer({
         postTokenBalances?: Array<{ owner?: string; mint?: string; uiTokenAmount?: { uiAmount?: number | string } }>;
       };
     }>('getTransaction', [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]);
-    if (!tx || !tx.meta) continue;
+    if (!tx || !tx.meta) {
+      debugEntries.push(`${signature.slice(0, 12)} missing meta`);
+      continue;
+    }
     const { meta } = tx;
     const preBalances = meta.preTokenBalances || [];
     const postBalances = meta.postTokenBalances || [];
@@ -124,6 +129,14 @@ async function findMatchingTransfer({
     const treasuryPre = preBalances.find((entry) => entry.owner === treasuryWallet && entry.mint === mint);
     const treasuryPost = postBalances.find((entry) => entry.owner === treasuryWallet && entry.mint === mint);
     if (!userPre || !userPost || !treasuryPost) {
+      const missingParts = [
+        !userPre ? 'userPre' : null,
+        !userPost ? 'userPost' : null,
+        !treasuryPost ? 'treasuryPost' : null,
+      ]
+        .filter((part): part is string => Boolean(part))
+        .join(', ');
+      debugEntries.push(`${signature.slice(0, 12)} missing ${missingParts || 'balances'}`);
       continue;
     }
     const userUiPre = Number(userPre.uiTokenAmount?.uiAmount || 0);
@@ -132,6 +145,11 @@ async function findMatchingTransfer({
     const treasuryUiPost = Number(treasuryPost.uiTokenAmount?.uiAmount || 0);
     const userDelta = userUiPre - userUiPost;
     const treasuryDelta = treasuryUiPost - treasuryUiPre;
+    const userDiff = Math.abs(userDelta - expectedAmount);
+    const treasuryDiff = Math.abs(treasuryDelta - expectedAmount);
+    debugEntries.push(
+      `${signature.slice(0, 12)} userΔ=${userDelta.toFixed(9)} (diff ${userDiff.toExponential(2)}), treasuryΔ=${treasuryDelta.toFixed(9)} (diff ${treasuryDiff.toExponential(2)})`
+    );
     if (almostEqual(userDelta, expectedAmount) && almostEqual(treasuryDelta, expectedAmount)) {
       return {
         signature,
@@ -141,6 +159,24 @@ async function findMatchingTransfer({
         treasuryDelta,
       };
     }
+  }
+  if (debugEntries.length) {
+    const sample = debugEntries.slice(0, 10);
+    logger.warn('[findMatchingTransfer] No matching transfer found', {
+      userWallet,
+      treasuryWallet,
+      mint,
+      expectedAmount,
+      inspectedSignatures: sample,
+      inspectedCount: debugEntries.length,
+    });
+  } else {
+    logger.warn('[findMatchingTransfer] No signatures returned', {
+      userWallet,
+      treasuryWallet,
+      mint,
+      expectedAmount,
+    });
   }
   return null;
 }
