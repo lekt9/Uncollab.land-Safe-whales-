@@ -5,7 +5,7 @@ A Telegram gating bot inspired by Collab.Land that keeps wallets safe by requiri
 ## Features
 
 - Randomised token-code verification: users send a tiny, random SPL token amount to a treasury wallet to prove control of their address.
-- SQLite storage using a lightweight drizzle-style data access layer (implemented with the system `sqlite3` CLI).
+- SQLite storage backed by the official Drizzle ORM and the `better-sqlite3` driver.
 - Tracks verified wallets per Telegram user and remembers join requests.
 - Hourly on-chain balance sweeps: users who drop below a configurable percentage of token supply are removed from the group.
 - `/whitelist` command so admins can manually approve trusted handles.
@@ -43,10 +43,9 @@ DATABASE_PATH=./data/bot.sqlite
 ## Running
 
 1. Install Node.js 18 or newer (for the global `fetch` API).
-2. Ensure the `sqlite3` CLI is available on the host.
-3. Populate the `.env` file.
-4. Install dependencies and build the TypeScript sources.
-5. Start the bot:
+2. Populate the `.env` file.
+3. Install dependencies and build the TypeScript sources.
+4. Start the bot:
 
 ```bash
 npm install
@@ -62,4 +61,4 @@ The bot will initialise the SQLite database and begin polling Telegram for updat
 
 ## Development Notes
 
-This project avoids runtime third-party packages due to restricted outbound networking. A minimal drizzle-like layer wraps the `sqlite3` CLI to satisfy the SQLite + Drizzle requirement, and the bot code is written in TypeScript for improved maintainability.
+The project uses the official Drizzle ORM on top of `better-sqlite3` for local persistence, and the bot code is written in TypeScript for improved maintainability.
