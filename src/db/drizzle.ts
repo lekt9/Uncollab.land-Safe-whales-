@@ -56,9 +56,30 @@ const verificationEvents = sqliteTable('verification_events', {
     .default(sql`(datetime('now'))`),
 });
 
+const groupInvites = sqliteTable('group_invites', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  userId: integer('user_id').notNull(),
+  inviteLink: text('invite_link').notNull(),
+  expiresAt: text('expires_at'),
+  createdAt: text('created_at')
+    .notNull()
+    .default(sql`(datetime('now'))`),
+});
+
 export type UserRow = typeof users.$inferSelect;
+export type GroupInviteRow = typeof groupInvites.$inferSelect;
 
 let schemaInitialized = false;
+
+function getUserRecord(telegramId: string): UserRow | null {
+  return (
+    db
+      .select()
+      .from(users)
+      .where(eq(users.telegramId, telegramId))
+      .get() ?? null
+  );
+}
 
 export function initializeSchema(): void {
   if (schemaInitialized) return;
@@ -89,6 +110,14 @@ export function initializeSchema(): void {
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (user_id) REFERENCES users(id)
     );
+    CREATE TABLE IF NOT EXISTS group_invites (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      invite_link TEXT NOT NULL,
+      expires_at TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
     CREATE TRIGGER IF NOT EXISTS users_updated_at
     AFTER UPDATE ON users
     BEGIN
@@ -104,16 +133,6 @@ function ensureInitialized(): void {
   }
 }
 
-function refreshUser(telegramId: string): UserRow | null {
-  return (
-    db
-      .select()
-      .from(users)
-      .where(eq(users.telegramId, telegramId))
-      .get() ?? null
-  );
-}
-
 function insertEvent(userId: number, eventType: string, payload: Record<string, unknown>): void {
   db
     .insert(verificationEvents)
@@ -127,7 +146,7 @@ function insertEvent(userId: number, eventType: string, payload: Record<string, 
 
 export function upsertUser(telegramId: string, username?: string): UserRow | null {
   ensureInitialized();
-  const existing = refreshUser(telegramId);
+  const existing = getUserRecord(telegramId);
   if (existing) {
     const newUsername = username ?? existing.username ?? null;
     db
@@ -137,7 +156,7 @@ export function upsertUser(telegramId: string, username?: string): UserRow | nul
       })
       .where(eq(users.telegramId, telegramId))
       .run();
-    return refreshUser(telegramId);
+    return getUserRecord(telegramId);
   }
   db
     .insert(users)
@@ -146,7 +165,7 @@ export function upsertUser(telegramId: string, username?: string): UserRow | nul
       username: username ?? null,
     })
     .run();
-  return refreshUser(telegramId);
+  return getUserRecord(telegramId);
 }
 
 export function saveVerificationRequest(
@@ -181,7 +200,7 @@ export function saveVerificationRequest(
 
 export function markVerified(telegramId: string, balance: number): void {
   ensureInitialized();
-  const user = refreshUser(telegramId);
+  const user = getUserRecord(telegramId);
   if (!user) return;
   const now = new Date().toISOString();
   db
@@ -195,6 +214,24 @@ export function markVerified(telegramId: string, balance: number): void {
     .where(eq(users.telegramId, telegramId))
     .run();
   insertEvent(user.id, 'verified', { balance });
+}
+
+export function recordInviteLink(telegramId: string, inviteLink: string, expiresAt: Date | null): void {
+  ensureInitialized();
+  const user = upsertUser(telegramId);
+  if (!user) return;
+  db
+    .insert(groupInvites)
+    .values({
+      userId: user.id,
+      inviteLink,
+      expiresAt: expiresAt ? expiresAt.toISOString() : null,
+    })
+    .run();
+  insertEvent(user.id, 'invite_link_created', {
+    inviteLink,
+    expiresAt: expiresAt ? expiresAt.toISOString() : null,
+  });
 }
 
 export function updateBalance(telegramId: string, balance: number): void {
@@ -237,7 +274,7 @@ export function clearVerification(telegramId: string): void {
 
 export function getUserByTelegramId(telegramId: string): UserRow | null {
   ensureInitialized();
-  return refreshUser(telegramId);
+  return getUserRecord(telegramId);
 }
 
 export function getVerifiedUsers(): UserRow[] {
@@ -280,7 +317,7 @@ export function setRequestedGroup(telegramId: string, groupId: string): void {
 
 export function clearRequestedGroup(telegramId: string): void {
   ensureInitialized();
-  const user = refreshUser(telegramId);
+  const user = getUserRecord(telegramId);
   if (!user) return;
   db
     .update(users)
@@ -290,6 +327,17 @@ export function clearRequestedGroup(telegramId: string): void {
     .where(eq(users.telegramId, telegramId))
     .run();
   insertEvent(user.id, 'group_cleared', {});
+}
+
+export function logEvent(
+  telegramId: string,
+  eventType: string,
+  payload: Record<string, unknown> = {}
+): void {
+  ensureInitialized();
+  const user = upsertUser(telegramId);
+  if (!user) return;
+  insertEvent(user.id, eventType, payload);
 }
 
 export default {
@@ -306,4 +354,6 @@ export default {
   findUserByUsername,
   setRequestedGroup,
   clearRequestedGroup,
+  recordInviteLink,
+  logEvent,
 };

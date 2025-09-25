@@ -1,106 +1,84 @@
+import TelegramBot from 'node-telegram-bot-api';
 import { config } from '../config';
 
-const API_BASE = `https://api.telegram.org/bot${config.telegramToken}`;
+export type TelegramMessage = TelegramBot.Message;
+export type TelegramChatJoinRequest = TelegramBot.ChatJoinRequest;
+export type TelegramChatMemberUpdated = TelegramBot.ChatMemberUpdated;
+export type ChatInviteLink = TelegramBot.ChatInviteLink;
 
 export interface SendMessageOptions {
-  parseMode?: string;
+  parseMode?: TelegramBot.ParseMode;
   disablePreview?: boolean;
-  replyMarkup?: unknown;
+  replyMarkup?: TelegramBot.SendMessageOptions['reply_markup'];
 }
 
-async function apiRequest<T>(method: string, payload: Record<string, unknown> = {}): Promise<T> {
+export interface CreateChatInviteLinkOptions {
+  expireDate?: number;
+  memberLimit?: number;
+  name?: string;
+  createsJoinRequest?: boolean;
+}
+
+let botInstance: TelegramBot | null = null;
+
+function ensureBot(): TelegramBot {
   if (!config.telegramToken) {
     throw new Error('TELEGRAM_BOT_TOKEN is not configured.');
   }
-  const url = `${API_BASE}/${method}`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Telegram API error ${response.status}: ${text}`);
+  if (!botInstance) {
+    botInstance = new TelegramBot(config.telegramToken, { polling: false });
   }
-  const json = await response.json();
-  if (!json.ok) {
-    throw new Error(`Telegram API responded with error: ${JSON.stringify(json)}`);
-  }
-  return json.result as T;
+  return botInstance;
 }
 
-export function sendMessage(chatId: number, text: string, options: SendMessageOptions = {}): Promise<unknown> {
-  return apiRequest('sendMessage', {
-    chat_id: chatId,
-    text,
-    parse_mode: options.parseMode || 'Markdown',
-    disable_web_page_preview: options.disablePreview !== false,
+export async function initializeBot(): Promise<TelegramBot> {
+  const bot = ensureBot();
+  if (!bot.isPolling()) {
+    await bot.startPolling();
+  }
+  return bot;
+}
+
+export function sendMessage(chatId: number, text: string, options: SendMessageOptions = {}): Promise<TelegramBot.Message> {
+  const bot = ensureBot();
+  return bot.sendMessage(chatId, text, {
+    parse_mode: options.parseMode ?? 'Markdown',
+    disable_web_page_preview: options.disablePreview ?? true,
     reply_markup: options.replyMarkup,
   });
 }
 
-export function approveChatJoinRequest(chatId: number, userId: number): Promise<unknown> {
-  return apiRequest('approveChatJoinRequest', {
-    chat_id: chatId,
-    user_id: userId,
-  });
-}
-
-export function declineChatJoinRequest(chatId: number, userId: number): Promise<unknown> {
-  return apiRequest('declineChatJoinRequest', {
-    chat_id: chatId,
-    user_id: userId,
-  });
-}
-
-export function kickChatMember(chatId: number, userId: number, untilDate?: number): Promise<unknown> {
-  return apiRequest('banChatMember', {
-    chat_id: chatId,
-    user_id: userId,
-    until_date: untilDate,
-  });
-}
-
-export function unbanChatMember(chatId: number, userId: number): Promise<unknown> {
-  return apiRequest('unbanChatMember', {
-    chat_id: chatId,
-    user_id: userId,
-  });
-}
-
-export interface TelegramUpdate {
-  update_id: number;
-  message?: {
-    message_id: number;
-    date: number;
-    chat: { id: number; type: string };
-    from: { id: number; username?: string; first_name?: string; last_name?: string };
-    text?: string;
+export function createChatInviteLink(chatId: number, options: CreateChatInviteLinkOptions = {}): Promise<ChatInviteLink> {
+  const bot = ensureBot();
+  const payload: TelegramBot.CreateChatInviteLinkOptions = {
+    expire_date: options.expireDate,
+    member_limit: options.memberLimit,
+    name: options.name,
+    creates_join_request: options.createsJoinRequest,
   };
-  chat_join_request?: {
-    from: { id: number; username?: string; first_name?: string };
-    chat: { id: number };
-  };
-  chat_member?: Record<string, unknown>;
-  my_chat_member?: Record<string, unknown>;
+  return bot.createChatInviteLink(chatId, payload);
 }
 
-export function getUpdates(offset: number, timeout = 30): Promise<TelegramUpdate[]> {
-  return apiRequest('getUpdates', {
-    offset,
-    timeout,
-    allowed_updates: ['message', 'chat_join_request', 'chat_member', 'my_chat_member'],
-  });
+export function approveChatJoinRequest(chatId: number, userId: number): Promise<boolean> {
+  return ensureBot().approveChatJoinRequest(chatId, userId);
 }
 
-export default {
-  apiRequest,
-  sendMessage,
-  approveChatJoinRequest,
-  declineChatJoinRequest,
-  kickChatMember,
-  unbanChatMember,
-  getUpdates,
-};
+export function declineChatJoinRequest(chatId: number, userId: number): Promise<boolean> {
+  return ensureBot().declineChatJoinRequest(chatId, userId);
+}
+
+export function kickChatMember(chatId: number, userId: number, untilDate?: number): Promise<boolean> {
+  if (untilDate) {
+    return ensureBot().banChatMember(chatId, userId, { until_date: untilDate });
+  }
+  return ensureBot().banChatMember(chatId, userId);
+}
+
+export function unbanChatMember(chatId: number, userId: number): Promise<boolean> {
+  return ensureBot().unbanChatMember(chatId, userId);
+}
+
+export function getBot(): TelegramBot {
+  return ensureBot();
+}
+

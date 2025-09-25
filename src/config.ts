@@ -60,6 +60,8 @@ export interface Config {
   hourlyCheckIntervalMs: number;
   adminIds: string[];
   databasePath: string;
+  inviteLinkTtlMinutes: number;
+  inviteLinkMemberLimit: number;
 }
 
 export const config: Config = {
@@ -74,6 +76,8 @@ export const config: Config = {
   hourlyCheckIntervalMs: parseNumber(process.env.HOURLY_CHECK_INTERVAL_MS, 60 * 60 * 1000),
   adminIds: parseStringArray(process.env.ADMIN_IDS),
   databasePath: process.env.DATABASE_PATH || path.resolve(process.cwd(), 'data', 'bot.sqlite'),
+  inviteLinkTtlMinutes: parseNumber(process.env.INVITE_LINK_TTL_MINUTES, 10),
+  inviteLinkMemberLimit: parseNumber(process.env.INVITE_LINK_MEMBER_LIMIT, 1),
 };
 
 if (!config.telegramToken) {
