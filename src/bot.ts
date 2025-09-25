@@ -121,7 +121,10 @@ async function handleVerify(message: TelegramMessage, args: string[]): Promise<v
   const expiresAt = new Date(Date.now() + VERIFICATION_WINDOW_MINUTES * 60 * 1000);
   db.saveVerificationRequest(String(from.id), wallet, verificationAmount, expiresAt, config.groupId || null);
   const instructions = [
-    `Your verification amount is *${verificationAmount}* tokens.`,
+    'Your verification amount is:',
+    '```',
+    `${verificationAmount} tokens`,
+    '```',
     `Send exactly this amount of the configured SPL token to the treasury wallet: \`${config.treasuryWallet}\`.`,
     '',
     `Once the transfer is confirmed on-chain, run /confirm to finish. This code expires in ${VERIFICATION_WINDOW_MINUTES} minutes.`,
