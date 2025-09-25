@@ -10,12 +10,15 @@ import {
   type TelegramMessage,
   type TelegramChatJoinRequest,
   type TelegramChatMemberUpdated,
+  type ChatInviteLink,
 } from './services/telegram';
 import { findMatchingTransfer, verifyOwnership } from './services/solana';
 import { getRandomVerificationAmount } from './utils/random';
 import * as logger from './utils/logger';
+import type { UserRow } from './db/drizzle';
 
 const VERIFICATION_WINDOW_MINUTES = 30;
+const TELEGRAM_MESSAGE_CHARACTER_LIMIT = 3500;
 
 function formatPercent(value: number): string {
   return (value * 100).toFixed(4);
@@ -24,6 +27,66 @@ function formatPercent(value: number): string {
 function sanitizeWallet(address?: string): string {
   if (!address) return '';
   return address.trim();
+}
+
+function isAdmin(telegramId: string): boolean {
+  return config.adminIds.includes(telegramId);
+}
+
+async function notifyAdmins(message: string): Promise<void> {
+  if (!config.adminIds.length) return;
+  await Promise.all(
+    config.adminIds.map(async (adminId) => {
+      const numericId = Number(adminId);
+      if (!Number.isFinite(numericId)) {
+        logger.warn(`Skipping admin notification for non-numeric ID ${adminId}`);
+        return;
+      }
+      try {
+        await sendMessage(numericId, message, { parseMode: undefined });
+      } catch (error) {
+        logger.warn(`Failed to notify admin ${adminId}`, error);
+      }
+    })
+  );
+}
+
+function formatUserIdentifier(user: UserRow | null): string {
+  if (!user) {
+    return 'unknown user';
+  }
+  if (user.username) {
+    return `@${user.username}`;
+  }
+  return `ID ${user.telegramId}`;
+}
+
+function chunkLines(lines: string[]): string[] {
+  const chunks: string[] = [];
+  let current: string[] = [];
+  let currentLength = 0;
+  for (const line of lines) {
+    if (currentLength + line.length + 1 > TELEGRAM_MESSAGE_CHARACTER_LIMIT) {
+      chunks.push(current.join('\n'));
+      current = [];
+      currentLength = 0;
+    }
+    current.push(line);
+    currentLength += line.length + 1;
+  }
+  if (current.length) {
+    chunks.push(current.join('\n'));
+  }
+  return chunks;
+}
+
+function formatAuditLine(user: UserRow, index: number): string {
+  const balance = user.lastBalance ?? 0;
+  const verifiedAt = user.verifiedAt ? new Date(user.verifiedAt).toISOString() : 'unknown';
+  const lastChecked = user.lastCheckedAt ? new Date(user.lastCheckedAt).toISOString() : 'unknown';
+  const wallet = user.walletAddress ?? 'n/a';
+  const status = user.isWhitelisted ? 'whitelisted' : 'verified';
+  return `${index + 1}. ${formatUserIdentifier(user)} — ${status}\n    Wallet: ${wallet}\n    Balance: ${balance}\n    Verified: ${verifiedAt}\n    Last sweep: ${lastChecked}`;
 }
 
 async function handleStart(message: TelegramMessage): Promise<void> {
@@ -76,7 +139,7 @@ function inviteExpirationNotice(): string {
   return `The invite link expires in ${config.inviteLinkTtlMinutes} minutes.`;
 }
 
-async function deliverInviteLink(userId: number, groupId: number): Promise<void> {
+async function deliverInviteLink(userId: number, groupId: number): Promise<ChatInviteLink> {
   const expireSeconds = config.inviteLinkTtlMinutes > 0 ? Math.max(60, Math.floor(config.inviteLinkTtlMinutes * 60)) : undefined;
   const invite = await createChatInviteLink(groupId, {
     expireDate: expireSeconds ? Math.floor(Date.now() / 1000) + expireSeconds : undefined,
@@ -98,6 +161,7 @@ async function deliverInviteLink(userId: number, groupId: number): Promise<void>
       inline_keyboard: [[{ text: 'Join the whale group', url: invite.invite_link }]],
     },
   });
+  return invite;
 }
 
 async function handleConfirm(message: TelegramMessage): Promise<void> {
@@ -105,11 +169,11 @@ async function handleConfirm(message: TelegramMessage): Promise<void> {
   const from = message.from;
   if (!from) return;
   const user = db.getUserByTelegramId(String(from.id));
-  if (!user || user.verification_code === null) {
+  if (!user || user.verificationCode === null) {
     await sendMessage(chatId, 'No active verification request found. Use /verify <wallet> to start.');
     return;
   }
-  if (!user.wallet_address) {
+  if (!user.walletAddress) {
     await sendMessage(chatId, 'Please set your wallet address using /verify <wallet> first.');
     return;
   }
@@ -117,8 +181,8 @@ async function handleConfirm(message: TelegramMessage): Promise<void> {
     await sendMessage(chatId, 'The bot is missing token mint or treasury configuration. Please contact an admin.');
     return;
   }
-  if (user.verification_expires_at) {
-    const expires = new Date(user.verification_expires_at);
+  if (user.verificationExpiresAt) {
+    const expires = new Date(user.verificationExpiresAt);
     if (Date.now() > expires.getTime()) {
       db.clearVerification(String(from.id));
       await sendMessage(chatId, 'Your verification code expired. Please start again with /verify <wallet>.');
@@ -127,17 +191,17 @@ async function handleConfirm(message: TelegramMessage): Promise<void> {
   }
   try {
     const transfer = await findMatchingTransfer({
-      userWallet: user.wallet_address,
+      userWallet: user.walletAddress,
       treasuryWallet: config.treasuryWallet,
       mint: config.tokenMint,
-      expectedAmount: user.verification_code,
+      expectedAmount: user.verificationCode,
     });
     if (!transfer) {
       await sendMessage(chatId, 'Could not find the matching transfer yet. Please wait a few moments and try /confirm again.');
       return;
     }
     const ownership = await verifyOwnership({
-      walletAddress: user.wallet_address,
+      walletAddress: user.walletAddress,
       mint: config.tokenMint,
       requiredPercent: config.requiredPercent,
     });
@@ -147,18 +211,19 @@ async function handleConfirm(message: TelegramMessage): Promise<void> {
     }
     db.markVerified(String(from.id), ownership.balance);
     db.clearVerification(String(from.id));
-    const groupId = user.requested_group_id || config.groupId;
+    const groupId = user.requestedGroupId || config.groupId;
     if (groupId) {
       const numericGroupId = Number(groupId);
-      if (user.requested_group_id) {
+      if (user.requestedGroupId) {
         try {
           await approveChatJoinRequest(numericGroupId, from.id);
         } catch (approvalError) {
           logger.warn('Failed to approve historical join request before issuing invite', approvalError);
         }
       }
+      let invite: ChatInviteLink | null = null;
       try {
-        await deliverInviteLink(from.id, numericGroupId);
+        invite = await deliverInviteLink(from.id, numericGroupId);
       } catch (inviteError) {
         logger.error('Failed to deliver invite link', inviteError);
         await sendMessage(chatId, 'Verification succeeded but we could not generate an invite link. Please contact an admin.');
@@ -166,8 +231,21 @@ async function handleConfirm(message: TelegramMessage): Promise<void> {
       } finally {
         db.clearRequestedGroup(String(from.id));
       }
+      const latestUser = db.getUserByTelegramId(String(from.id));
+      const adminLines = [
+        `✅ Verified ${formatUserIdentifier(latestUser)} (${from.id})`,
+        `Wallet: ${latestUser?.walletAddress ?? user.walletAddress}`,
+        `Balance: ${ownership.balance}`,
+      ];
+      if (invite) {
+        adminLines.push(`Invite link: ${invite.invite_link}`);
+      }
+      await notifyAdmins(adminLines.join('\n'));
     } else {
       await sendMessage(chatId, 'Verification successful! An admin will add you to the group shortly.');
+      await notifyAdmins(
+        [`✅ Verified ${formatUserIdentifier(user)} (${from.id})`, `Wallet: ${user.walletAddress}`, `Balance: ${ownership.balance}`].join('\n')
+      );
     }
   } catch (error) {
     logger.error('Verification failed', error);
@@ -186,16 +264,16 @@ async function handleStatus(message: TelegramMessage): Promise<void> {
     return;
   }
   const lines: string[] = [];
-  lines.push(`Wallet: ${user.wallet_address || 'Not set'}`);
+  lines.push(`Wallet: ${user.walletAddress || 'Not set'}`);
   lines.push(`Verified: ${user.verified ? 'Yes' : 'No'}`);
-  if (user.last_balance !== null && user.last_balance !== undefined) {
-    lines.push(`Last balance: ${user.last_balance}`);
+  if (user.lastBalance !== null && user.lastBalance !== undefined) {
+    lines.push(`Last balance: ${user.lastBalance}`);
   }
-  if (user.verified_at) {
-    lines.push(`Verified at: ${user.verified_at}`);
+  if (user.verifiedAt) {
+    lines.push(`Verified at: ${user.verifiedAt}`);
   }
-  if (user.verification_code) {
-    lines.push(`Pending verification amount: ${user.verification_code}`);
+  if (user.verificationCode) {
+    lines.push(`Pending verification amount: ${user.verificationCode}`);
   }
   await sendMessage(chatId, lines.join('\n'));
 }
@@ -204,7 +282,7 @@ async function handleWhitelist(message: TelegramMessage, args: string[]): Promis
   const from = message.from;
   if (!from) return;
   const fromId = String(from.id);
-  if (!config.adminIds.includes(fromId)) {
+  if (!isAdmin(fromId)) {
     await sendMessage(message.chat.id, 'You are not authorized to use this command.');
     return;
   }
@@ -217,7 +295,7 @@ async function handleWhitelist(message: TelegramMessage, args: string[]): Promis
     targetId = targetId.slice(1);
     const match = db.findUserByUsername(targetId);
     if (match) {
-      targetId = String(match.telegram_id);
+      targetId = String(match.telegramId);
     } else {
       await sendMessage(message.chat.id, `Could not find a user with username @${targetId}.`);
       return;
@@ -225,16 +303,56 @@ async function handleWhitelist(message: TelegramMessage, args: string[]): Promis
   }
   db.setWhitelist(String(targetId), true);
   const user = db.getUserByTelegramId(String(targetId));
-  if (user && user.requested_group_id) {
+  if (user && user.requestedGroupId) {
     try {
-      await approveChatJoinRequest(Number(user.requested_group_id), Number(user.telegram_id));
-      await sendMessage(Number(user.telegram_id), 'An admin added you to the whitelist and you have been approved to join.');
-      db.clearRequestedGroup(String(user.telegram_id));
+      await approveChatJoinRequest(Number(user.requestedGroupId), Number(user.telegramId));
+      await sendMessage(Number(user.telegramId), 'An admin added you to the whitelist and you have been approved to join.');
+      db.clearRequestedGroup(String(user.telegramId));
     } catch (error) {
       logger.error('Failed to approve whitelisted user', error);
     }
   }
   await sendMessage(message.chat.id, `Whitelisted user ${targetId}.`);
+}
+
+async function handleAudit(message: TelegramMessage): Promise<void> {
+  const from = message.from;
+  if (!from) return;
+  if (!isAdmin(String(from.id))) {
+    await sendMessage(message.chat.id, 'You are not authorized to use this command.');
+    return;
+  }
+  const verifiedUsers = db.getVerifiedUsers();
+  const pendingUsers = db.getPendingUsers();
+  if (!verifiedUsers.length && !pendingUsers.length) {
+    await sendMessage(message.chat.id, 'No whales have verified yet.');
+    return;
+  }
+  const sortedVerified = [...verifiedUsers].sort((a, b) => {
+    const aBalance = a.lastBalance ?? 0;
+    const bBalance = b.lastBalance ?? 0;
+    return bBalance - aBalance;
+  });
+  const lines: string[] = [];
+  lines.push(`Verified whales: ${sortedVerified.length}`);
+  lines.push(`Pending verifications: ${pendingUsers.length}`);
+  lines.push('');
+  sortedVerified.forEach((user, index) => {
+    lines.push(formatAuditLine(user, index));
+    lines.push('');
+  });
+  if (pendingUsers.length) {
+    lines.push('Pending users:');
+    pendingUsers.forEach((user) => {
+      lines.push(
+        `- ${formatUserIdentifier(user)} — wallet: ${user.walletAddress ?? 'n/a'}, requested group: ${user.requestedGroupId ?? 'n/a'}`
+      );
+    });
+  }
+  const messageChunks = chunkLines(lines.filter(Boolean));
+  for (const chunk of messageChunks) {
+    await sendMessage(message.chat.id, chunk, { parseMode: undefined });
+  }
 }
 
 async function handleMessage(message: TelegramMessage): Promise<void> {
@@ -258,8 +376,14 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     case '/whitelist':
       await handleWhitelist(message, rest);
       break;
+    case '/audit':
+      await handleAudit(message);
+      break;
     default:
-      await sendMessage(message.chat.id, 'Unknown command. Available commands: /start, /verify, /confirm, /status.');
+      await sendMessage(
+        message.chat.id,
+        'Unknown command. Available commands: /start, /verify, /confirm, /status, /whitelist, /audit.'
+      );
   }
 }
 
@@ -269,7 +393,7 @@ async function handleChatJoinRequest(request: TelegramChatJoinRequest): Promise<
   db.setRequestedGroup(userId, String(request.chat.id));
   db.upsertUser(userId, username);
   const user = db.getUserByTelegramId(userId);
-  if (user && user.is_whitelisted) {
+  if (user && user.isWhitelisted) {
     await approveChatJoinRequest(request.chat.id, request.from.id);
     await sendMessage(request.from.id, 'You are whitelisted and have been approved to join the group.');
     db.clearRequestedGroup(userId);
@@ -306,32 +430,43 @@ async function runOwnershipSweep(): Promise<void> {
   }
   logger.log(`Ownership sweep: checking ${users.length} users.`);
   for (const user of users) {
-    if (user.is_whitelisted) {
+    if (user.isWhitelisted) {
       continue;
     }
     try {
-      if (!user.wallet_address) {
+      if (!user.walletAddress) {
         continue;
       }
       const ownership = await verifyOwnership({
-        walletAddress: user.wallet_address,
+        walletAddress: user.walletAddress,
         mint: config.tokenMint,
         requiredPercent: config.requiredPercent,
       });
-      db.updateBalance(String(user.telegram_id), ownership.balance);
+      db.updateBalance(String(user.telegramId), ownership.balance);
       if (!ownership.isQualified) {
-        logger.warn(`User ${user.telegram_id} dropped below threshold. Kicking.`);
+        logger.warn(`User ${user.telegramId} dropped below threshold. Kicking.`);
         if (config.groupId) {
-          await kickChatMember(Number(config.groupId), Number(user.telegram_id));
-          await unbanChatMember(Number(config.groupId), Number(user.telegram_id));
+          await kickChatMember(Number(config.groupId), Number(user.telegramId));
+          await unbanChatMember(Number(config.groupId), Number(user.telegramId));
         }
         await sendMessage(
-          Number(user.telegram_id),
+          Number(user.telegramId),
           `You were removed from the group because your holdings fell to ${formatPercent(ownership.percentOwned)}% of supply. Required: ${formatPercent(config.requiredPercent)}%.`
+        );
+        db.logEvent(String(user.telegramId), 'ownership_revoked', {
+          balance: ownership.balance,
+          percentOwned: ownership.percentOwned,
+        });
+        await notifyAdmins(
+          [
+            `⚠️ Removed ${formatUserIdentifier(user)} (${user.telegramId}) for dropping below threshold`,
+            `Latest balance: ${ownership.balance}`,
+            `Percent owned: ${formatPercent(ownership.percentOwned)}%`,
+          ].join('\n')
         );
       }
     } catch (error) {
-      logger.error('Ownership sweep error for user', user.telegram_id, error);
+      logger.error('Ownership sweep error for user', user.telegramId, error);
     }
   }
 }
