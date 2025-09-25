@@ -1,26 +1,17 @@
 import fs from 'fs';
 import path from 'path';
-import { execFileSync } from 'child_process';
+import Database from 'better-sqlite3';
+import { drizzle, BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import {
+  sqliteTable,
+  integer,
+  text,
+  real,
+} from 'drizzle-orm/sqlite-core';
+import { and, eq, isNotNull, sql } from 'drizzle-orm';
 import { config } from '../config';
 
 const DB_PATH = config.databasePath;
-
-export interface UserRow {
-  id: number;
-  telegram_id: string;
-  username: string | null;
-  wallet_address: string | null;
-  verification_code: number | null;
-  verification_expires_at: string | null;
-  verified: 0 | 1;
-  verified_at: string | null;
-  last_balance: number | null;
-  last_checked_at: string | null;
-  is_whitelisted: 0 | 1;
-  requested_group_id: string | null;
-  created_at: string;
-  updated_at: string;
-}
 
 function ensureDatabaseDirectory(): void {
   const dir = path.dirname(DB_PATH);
@@ -29,68 +20,52 @@ function ensureDatabaseDirectory(): void {
   }
 }
 
-function runSql(sql: string): void {
-  ensureDatabaseDirectory();
-  execFileSync('sqlite3', [DB_PATH, sql]);
-}
+ensureDatabaseDirectory();
 
-function runSqlScript(lines: string[]): void {
-  const script = lines.join('\n');
-  ensureDatabaseDirectory();
-  execFileSync('sqlite3', [DB_PATH], { input: script });
-}
+const sqlite = new Database(DB_PATH);
+const db: BetterSQLite3Database = drizzle(sqlite);
 
-function queryJson<T>(sql: string): T[] {
-  ensureDatabaseDirectory();
-  const output = execFileSync('sqlite3', ['-json', DB_PATH, sql], {
-    encoding: 'utf8',
-  });
-  if (!output) {
-    return [];
-  }
-  try {
-    return JSON.parse(output) as T[];
-  } catch (error) {
-    console.error('Failed to parse sqlite JSON output', error, output);
-    return [];
-  }
-}
+const users = sqliteTable('users', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  telegramId: text('telegram_id').notNull().unique(),
+  username: text('username'),
+  walletAddress: text('wallet_address'),
+  verificationCode: real('verification_code'),
+  verificationExpiresAt: text('verification_expires_at'),
+  verified: integer('verified').notNull().default(0),
+  verifiedAt: text('verified_at'),
+  lastBalance: real('last_balance'),
+  lastCheckedAt: text('last_checked_at'),
+  isWhitelisted: integer('is_whitelisted').notNull().default(0),
+  requestedGroupId: text('requested_group_id'),
+  createdAt: text('created_at')
+    .notNull()
+    .default(sql`(datetime('now'))`),
+  updatedAt: text('updated_at')
+    .notNull()
+    .default(sql`(datetime('now'))`),
+});
 
-function escapeValue(value: unknown): string {
-  if (value === null || value === undefined) return 'NULL';
-  if (typeof value === 'number') return value.toString();
-  if (typeof value === 'boolean') return value ? '1' : '0';
-  const sanitized = String(value).replace(/'/g, "''");
-  return `'${sanitized}'`;
-}
+const verificationEvents = sqliteTable('verification_events', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  userId: integer('user_id').notNull(),
+  eventType: text('event_type').notNull(),
+  payload: text('payload'),
+  createdAt: text('created_at')
+    .notNull()
+    .default(sql`(datetime('now'))`),
+});
 
-function formatSql(sql: string, params: unknown[]): string {
-  let formatted = sql;
-  for (const param of params) {
-    formatted = formatted.replace('?', escapeValue(param));
-  }
-  return formatted;
-}
+export type UserRow = typeof users.$inferSelect;
 
-function run(sql: string, params: unknown[] = []): void {
-  const formatted = formatSql(sql, params);
-  runSql(formatted);
-}
-
-function all<T>(sql: string, params: unknown[] = []): T[] {
-  const formatted = formatSql(sql, params);
-  return queryJson<T>(formatted);
-}
-
-function get<T>(sql: string, params: unknown[] = []): T | null {
-  const rows = all<T>(sql, params);
-  return rows.length > 0 ? rows[0] : null;
-}
+let schemaInitialized = false;
 
 export function initializeSchema(): void {
-  runSqlScript([
-    'PRAGMA journal_mode = WAL;',
-    `CREATE TABLE IF NOT EXISTS users (
+  if (schemaInitialized) return;
+  sqlite.pragma('journal_mode = WAL');
+  sqlite.pragma('foreign_keys = ON');
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       telegram_id TEXT UNIQUE NOT NULL,
       username TEXT,
@@ -105,31 +80,73 @@ export function initializeSchema(): void {
       requested_group_id TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
-    );`,
-    `CREATE TABLE IF NOT EXISTS verification_events (
+    );
+    CREATE TABLE IF NOT EXISTS verification_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
       event_type TEXT NOT NULL,
       payload TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (user_id) REFERENCES users(id)
-    );`,
-    `CREATE TRIGGER IF NOT EXISTS users_updated_at
+    );
+    CREATE TRIGGER IF NOT EXISTS users_updated_at
     AFTER UPDATE ON users
     BEGIN
       UPDATE users SET updated_at = datetime('now') WHERE id = NEW.id;
-    END;`,
-  ]);
+    END;
+  `);
+  schemaInitialized = true;
+}
+
+function ensureInitialized(): void {
+  if (!schemaInitialized) {
+    initializeSchema();
+  }
+}
+
+function refreshUser(telegramId: string): UserRow | null {
+  return (
+    db
+      .select()
+      .from(users)
+      .where(eq(users.telegramId, telegramId))
+      .get() ?? null
+  );
+}
+
+function insertEvent(userId: number, eventType: string, payload: Record<string, unknown>): void {
+  db
+    .insert(verificationEvents)
+    .values({
+      userId,
+      eventType,
+      payload: Object.keys(payload).length ? JSON.stringify(payload) : null,
+    })
+    .run();
 }
 
 export function upsertUser(telegramId: string, username?: string): UserRow | null {
-  const existing = get<UserRow>('SELECT * FROM users WHERE telegram_id = ?', [telegramId]);
+  ensureInitialized();
+  const existing = refreshUser(telegramId);
   if (existing) {
-    run("UPDATE users SET username = ?, updated_at = datetime('now') WHERE telegram_id = ?", [username || existing.username, telegramId]);
-    return get<UserRow>('SELECT * FROM users WHERE telegram_id = ?', [telegramId]);
+    const newUsername = username ?? existing.username ?? null;
+    db
+      .update(users)
+      .set({
+        username: newUsername,
+      })
+      .where(eq(users.telegramId, telegramId))
+      .run();
+    return refreshUser(telegramId);
   }
-  run('INSERT INTO users (telegram_id, username) VALUES (?, ?)', [telegramId, username || null]);
-  return get<UserRow>('SELECT * FROM users WHERE telegram_id = ?', [telegramId]);
+  db
+    .insert(users)
+    .values({
+      telegramId,
+      username: username ?? null,
+    })
+    .run();
+  return refreshUser(telegramId);
 }
 
 export function saveVerificationRequest(
@@ -140,98 +157,139 @@ export function saveVerificationRequest(
   requestedGroupId: string | null
 ): void {
   const user = upsertUser(telegramId);
-  run(
-    `UPDATE users SET wallet_address = ?, verification_code = ?, verification_expires_at = ?, verified = 0, requested_group_id = COALESCE(?, requested_group_id) WHERE telegram_id = ?`,
-    [walletAddress, verificationCode, expiresAt ? expiresAt.toISOString() : null, requestedGroupId || null, telegramId]
-  );
-  if (user) {
-    run('INSERT INTO verification_events (user_id, event_type, payload) VALUES (?, ?, ?)', [
-      user.id,
-      'verification_requested',
-      JSON.stringify({ walletAddress, verificationCode, expiresAt: expiresAt ? expiresAt.toISOString() : null }),
-    ]);
+  if (!user) return;
+  const updates: Partial<typeof users.$inferInsert> = {
+    walletAddress,
+    verificationCode,
+    verificationExpiresAt: expiresAt ? expiresAt.toISOString() : null,
+    verified: 0,
+  };
+  if (requestedGroupId !== null && requestedGroupId !== undefined) {
+    updates.requestedGroupId = requestedGroupId;
   }
+  db
+    .update(users)
+    .set(updates)
+    .where(eq(users.telegramId, telegramId))
+    .run();
+  insertEvent(user.id, 'verification_requested', {
+    walletAddress,
+    verificationCode,
+    expiresAt: expiresAt ? expiresAt.toISOString() : null,
+  });
 }
 
 export function markVerified(telegramId: string, balance: number): void {
-  const user = get<UserRow>('SELECT * FROM users WHERE telegram_id = ?', [telegramId]);
+  ensureInitialized();
+  const user = refreshUser(telegramId);
   if (!user) return;
-  run(
-    "UPDATE users SET verified = 1, verified_at = datetime('now'), last_balance = ?, last_checked_at = datetime('now') WHERE telegram_id = ?",
-    [balance, telegramId]
-  );
-  run('INSERT INTO verification_events (user_id, event_type, payload) VALUES (?, ?, ?)', [
-    user.id,
-    'verified',
-    JSON.stringify({ balance }),
-  ]);
+  const now = new Date().toISOString();
+  db
+    .update(users)
+    .set({
+      verified: 1,
+      verifiedAt: now,
+      lastBalance: balance,
+      lastCheckedAt: now,
+    })
+    .where(eq(users.telegramId, telegramId))
+    .run();
+  insertEvent(user.id, 'verified', { balance });
 }
 
 export function updateBalance(telegramId: string, balance: number): void {
-  const user = get<UserRow>('SELECT * FROM users WHERE telegram_id = ?', [telegramId]);
-  if (!user) return;
-  run(
-    "UPDATE users SET last_balance = ?, last_checked_at = datetime('now') WHERE telegram_id = ?",
-    [balance, telegramId]
-  );
+  ensureInitialized();
+  const now = new Date().toISOString();
+  db
+    .update(users)
+    .set({
+      lastBalance: balance,
+      lastCheckedAt: now,
+    })
+    .where(eq(users.telegramId, telegramId))
+    .run();
 }
 
 export function setWhitelist(telegramId: string, isWhitelisted: boolean): void {
   const user = upsertUser(telegramId);
-  run('UPDATE users SET is_whitelisted = ? WHERE telegram_id = ?', [isWhitelisted ? 1 : 0, telegramId]);
-  if (user) {
-    run('INSERT INTO verification_events (user_id, event_type, payload) VALUES (?, ?, ?)', [
-      user.id,
-      'whitelist_updated',
-      JSON.stringify({ isWhitelisted }),
-    ]);
-  }
+  if (!user) return;
+  db
+    .update(users)
+    .set({
+      isWhitelisted: isWhitelisted ? 1 : 0,
+    })
+    .where(eq(users.telegramId, telegramId))
+    .run();
+  insertEvent(user.id, 'whitelist_updated', { isWhitelisted });
 }
 
 export function clearVerification(telegramId: string): void {
-  run(
-    'UPDATE users SET verification_code = NULL, verification_expires_at = NULL WHERE telegram_id = ?',
-    [telegramId]
-  );
+  ensureInitialized();
+  db
+    .update(users)
+    .set({
+      verificationCode: null,
+      verificationExpiresAt: null,
+    })
+    .where(eq(users.telegramId, telegramId))
+    .run();
 }
 
 export function getUserByTelegramId(telegramId: string): UserRow | null {
-  return get<UserRow>('SELECT * FROM users WHERE telegram_id = ?', [telegramId]);
+  ensureInitialized();
+  return refreshUser(telegramId);
 }
 
 export function getVerifiedUsers(): UserRow[] {
-  return all<UserRow>('SELECT * FROM users WHERE verified = 1');
+  ensureInitialized();
+  return db.select().from(users).where(eq(users.verified, 1)).all();
 }
 
 export function getPendingUsers(): UserRow[] {
-  return all<UserRow>('SELECT * FROM users WHERE verified = 0 AND verification_code IS NOT NULL');
+  ensureInitialized();
+  return db
+    .select()
+    .from(users)
+    .where(and(eq(users.verified, 0), isNotNull(users.verificationCode)))
+    .all();
 }
 
 export function findUserByUsername(username: string): UserRow | null {
-  return get<UserRow>('SELECT * FROM users WHERE LOWER(username) = LOWER(?)', [username]);
+  ensureInitialized();
+  return (
+    db
+      .select()
+      .from(users)
+      .where(sql`lower(${users.username}) = lower(${username})`)
+      .get() ?? null
+  );
 }
 
 export function setRequestedGroup(telegramId: string, groupId: string): void {
   const user = upsertUser(telegramId);
-  run('UPDATE users SET requested_group_id = ? WHERE telegram_id = ?', [groupId, telegramId]);
-  if (user) {
-    run('INSERT INTO verification_events (user_id, event_type, payload) VALUES (?, ?, ?)', [
-      user.id,
-      'group_requested',
-      JSON.stringify({ groupId }),
-    ]);
-  }
+  if (!user) return;
+  db
+    .update(users)
+    .set({
+      requestedGroupId: groupId,
+    })
+    .where(eq(users.telegramId, telegramId))
+    .run();
+  insertEvent(user.id, 'group_requested', { groupId });
 }
 
 export function clearRequestedGroup(telegramId: string): void {
-  const user = get<UserRow>('SELECT * FROM users WHERE telegram_id = ?', [telegramId]);
+  ensureInitialized();
+  const user = refreshUser(telegramId);
   if (!user) return;
-  run('UPDATE users SET requested_group_id = NULL WHERE telegram_id = ?', [telegramId]);
-  run('INSERT INTO verification_events (user_id, event_type, payload) VALUES (?, ?, ?)', [
-    user.id,
-    'group_cleared',
-    JSON.stringify({}),
-  ]);
+  db
+    .update(users)
+    .set({
+      requestedGroupId: null,
+    })
+    .where(eq(users.telegramId, telegramId))
+    .run();
+  insertEvent(user.id, 'group_cleared', {});
 }
 
 export default {
